@@ -1,16 +1,16 @@
 name: Deployment Setup Steps Monitor
 
 on:
+  issues:
+    types: [closed]
   pull_request:
     types: [closed]
     branches:
       - main
-  deployment_status:
-    types: [created]
 
 jobs:
   check-setup-steps:
-    if: github.event.pull_request.merged == true || github.event_name == 'deployment_status'
+    if: github.event.pull_request.merged == true || github.event_name == 'issues'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -21,86 +21,75 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const getPRNumber = async () => {
-              if (context.eventName === 'pull_request') {
-                return context.payload.pull_request.number;
-              } else if (context.eventName === 'deployment_status') {
-                // Get the commit message to extract PR number
-                const commit = await github.rest.repos.getCommit({
+            async function processIssue(issueNumber) {
+              try {
+                const { data: issue } = await github.rest.issues.get({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  ref: context.payload.deployment.sha
+                  issue_number: issueNumber
                 });
-                const prMatch = commit.data.commit.message.match(/#(\d+)/);
-                return prMatch ? parseInt(prMatch[1]) : null;
-              }
-              return null;
-            };
 
-            const prNumber = await getPRNumber();
-            if (!prNumber) {
-              console.log('No related PR found');
-              return;
+                const { data: comments } = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber
+                });
+
+                // Check issue body and comments for "Step setup"
+                const setupSteps = [];
+                if (issue.body && issue.body.includes('Step setup')) {
+                  setupSteps.push(issue.body);
+                }
+
+                comments.forEach(comment => {
+                  if (comment.body && comment.body.includes('Step setup')) {
+                    setupSteps.push(comment.body);
+                  }
+                });
+
+                if (setupSteps.length > 0) {
+                  const eventType = context.eventName === 'issues' ? 'issue closure' : 'merge to main';
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    body: `🔔 **Setup Steps Required - ${eventType}**
+
+                    This issue contains setup steps that need attention during ${eventType}.
+                    
+                    Please review the setup instructions in the comments above and ensure all necessary steps are completed.
+                    
+                    Event details:
+                    - Type: ${eventType}
+                    - Branch: main
+                    - Triggered by: ${context.actor}`
+                  });
+                }
+              } catch (error) {
+                console.log(`Error processing issue ${issueNumber}: ${error.message}`);
+              }
             }
 
-            // Get PR details to find linked issues
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber
-            });
+            try {
+              if (context.eventName === 'issues') {
+                // Process the closed issue
+                await processIssue(context.payload.issue.number);
+              } else if (context.eventName === 'pull_request' && context.payload.pull_request.merged) {
+                // For merged PRs, check the PR body for linked issues
+                const prBody = context.payload.pull_request.body || '';
+                const issueRefs = prBody.match(/#(\d+)/g) || [];
+                const issueNumbers = new Set();
 
-            // Extract issue numbers from PR body
-            const issueNumbers = [];
-            const issueRefs = pr.body.match(/#(\d+)/g) || [];
-            issueRefs.forEach(ref => {
-              const num = parseInt(ref.substring(1));
-              if (!isNaN(num)) issueNumbers.push(num);
-            });
-
-            // Check each linked issue for setup steps
-            for (const issueNumber of issueNumbers) {
-              const { data: issue } = await github.rest.issues.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueNumber
-              });
-
-              const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueNumber
-              });
-
-              // Check issue body and comments for "Step setup"
-              const setupSteps = [];
-              if (issue.body && issue.body.includes('Step setup')) {
-                setupSteps.push(issue.body);
-              }
-
-              comments.forEach(comment => {
-                if (comment.body && comment.body.includes('Step setup')) {
-                  setupSteps.push(comment.body);
-                }
-              });
-
-              if (setupSteps.length > 0) {
-                // Create notification comment
-                const eventType = context.eventName === 'deployment_status' ? 'deployment' : 'merge to dev';
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issueNumber,
-                  body: `🔔 **Setup Steps Required - ${eventType}**
-
-                  This issue contains setup steps that need attention during ${eventType}.
-                  
-                  Please review the setup instructions in the comments above and ensure all necessary steps are completed.
-                  
-                  Event details:
-                  - Type: ${eventType}
-                  - Branch: ${context.eventName === 'deployment_status' ? context.payload.deployment.environment : 'dev'}
-                  - Triggered by: ${context.actor}`
+                issueRefs.forEach(ref => {
+                  const num = parseInt(ref.substring(1));
+                  if (!isNaN(num)) issueNumbers.add(num);
                 });
+
+                // Process each linked issue
+                for (const issueNumber of issueNumbers) {
+                  await processIssue(issueNumber);
+                }
               }
+            } catch (error) {
+              console.log(`Workflow error: ${error.message}`);
             } 
